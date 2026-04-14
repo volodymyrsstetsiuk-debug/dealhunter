@@ -1,10 +1,8 @@
 """
-deal_hunter.py  v5
-- Freshness: all sources filtered to last 36h only
-- Reddit: min upvotes enforced, digital-only deals skipped, r/GameDeals physical-only
-- Twitter: RSSBridge public instances (free, no API key needed)
-- Amazon + eBay sold price enrichment
-- One Telegram card per deal
+deal_hunter.py  v6
+- Twitter: Nitter + RSSBridge fetched via ScraperAPI (residential IPs bypass datacenter blocks)
+- Runs every 2h — MAX_AGE_HOURS=3 so you only see posts from the last run window
+- seen.json deduplication ensures no repeats across runs
 """
 
 import os, json, re, time, hashlib, logging
@@ -20,9 +18,8 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SCRAPER_API_KEY  = os.environ.get("SCRAPER_API_KEY", "")
 SEEN_FILE        = "seen.json"
 MIN_SCORE        = 15
-MAX_AGE_HOURS    = 36   # ignore anything older than this
+MAX_AGE_HOURS    = 0.5  # 30-min window — seen.json handles dedup, this just blocks truly stale posts
 
-# ── keywords ───────────────────────────────────────────────────────────────────
 KEYWORDS_BOOST = [
     "lego","pokemon","pokémon","nintendo","switch","ps5","xbox","playstation",
     "apple","ipad","airpods","macbook","iphone","dyson","keurig","instant pot",
@@ -36,35 +33,39 @@ KEYWORDS_BOOST = [
 KEYWORDS_SKIP = [
     "porn","adult","casino","gambling","cbd","vape","tobacco",
     "crypto","nft","insurance","mortgage","loan","forex",
-    # digital-only signals (no physical product to flip)
     "steam key","steam code","epic games","xbox game pass","ps plus",
     "playstation plus","humble bundle","digital code","digital download",
     "google play credit","app store credit","ebook","kindle",
 ]
 
-# Reddit: subreddits + their minimum upvote threshold
 REDDIT_SUBS = {
-    "deals":         50,   # high noise, require engagement
+    "deals":         50,
     "Flipping":      10,
     "buildapcsales": 30,
     "MUAontheCheap": 20,
     "flipping":      10,
-    # GameDeals kept but physical-only filter applied below
     "GameDeals":     100,
 }
 
-# Twitter accounts → fetched via RSSBridge (no API key needed)
-TWITTER_ACCOUNTS = [
-    "Pricerrors", "DealsPlus", "GottaDEAL", "DealNews", "SlickdealsNet",
-    "1saleaday", "bradsdeals", "dealnews",
+# Nitter instances + RSSBridge — all fetched through ScraperAPI (residential IPs)
+NITTER_INSTANCES = [
+    "https://nitter.poast.org",
+    "https://xcancel.com",
+    "https://nitter.mint.lgbt",
+    "https://nitter.privacydev.net",
+    "https://lightbrd.com",
+    "https://nitter.tiekoetter.com",
 ]
 RSSBRIDGE_INSTANCES = [
     "https://rssbridge.flossxyz.com/",
     "https://wtf.roflcopter.fr/rss/",
     "https://rss-bridge.org/bridge01/",
 ]
+TWITTER_ACCOUNTS = [
+    "Pricerrors", "DealsPlus", "GottaDEAL", "DealNews",
+    "SlickdealsNet", "1saleaday", "bradsdeals", "MaximumDeals",
+]
 
-# CamelCamelCamel watchlist: (ASIN, max_price, label)
 CCC_WATCHLIST = [
     # ("B08N5WRWNW", 80, "LEGO Millennium Falcon"),
 ]
@@ -72,19 +73,21 @@ CCC_WATCHLIST = [
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
-NOW = datetime.now(timezone.utc)
+NOW    = datetime.now(timezone.utc)
 CUTOFF = NOW - timedelta(hours=MAX_AGE_HOURS)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def scraper_get(url, retries=2, **params):
+def scraper_get(url, retries=2, render=False):
+    """Fetch via ScraperAPI (residential proxy). Falls back to direct if no key."""
     for attempt in range(retries + 1):
         try:
             if SCRAPER_API_KEY:
-                p = {"api_key": SCRAPER_API_KEY, "url": url}
-                p.update(params)
-                r = SESSION.get("https://api.scraperapi.com/", params=p, timeout=45)
+                params = {"api_key": SCRAPER_API_KEY, "url": url}
+                if render:
+                    params["render"] = "true"
+                r = SESSION.get("https://api.scraperapi.com/", params=params, timeout=45)
             else:
                 r = SESSION.get(url, timeout=20)
             r.raise_for_status()
@@ -108,15 +111,13 @@ def deal_id(title, url=""):
     return hashlib.md5((title + url).encode()).hexdigest()[:12]
 
 def is_fresh(dt):
-    """dt should be a timezone-aware datetime. Returns True if within MAX_AGE_HOURS."""
     if dt is None:
-        return True  # no date info → don't filter out
+        return True
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt >= CUTOFF
 
-def entry_published(entry):
-    """Extract published datetime from a feedparser entry."""
+def entry_dt(entry):
     tp = entry.get("published_parsed") or entry.get("updated_parsed")
     if not tp:
         return None
@@ -124,6 +125,14 @@ def entry_published(entry):
         return datetime(*tp[:6], tzinfo=timezone.utc)
     except Exception:
         return None
+
+def age_label(dt):
+    if not dt:
+        return ""
+    mins = int((NOW - dt).total_seconds() // 60)
+    if mins < 60:
+        return f" [{mins}m ago]"
+    return f" [{mins//60}h ago]"
 
 def score_deal(title, body="", source=""):
     t = (title + " " + body + " " + source).lower()
@@ -146,36 +155,31 @@ def score_deal(title, body="", source=""):
     return s
 
 def is_physical_game(title):
-    """For r/GameDeals: only pass physical/collector items, not digital keys."""
     t = title.lower()
-    physical_signals = ["physical","collector","limited edition","steelbook","box","cartridge","disc"]
-    digital_signals  = ["dlc","season pass","digital","key","code","subscription","membership","psn","xbl","pc "]
-    if any(d in t for d in digital_signals):
+    if any(d in t for d in ["dlc","season pass","digital","key","code","subscription","membership","psn","xbl","pc "]):
         return False
-    return any(p in t for p in physical_signals)
+    return any(p in t for p in ["physical","collector","limited edition","steelbook","box","cartridge","disc"])
 
 
 # ── sources ────────────────────────────────────────────────────────────────────
 
-def fetch_rss(feed_url, source_name):
+def fetch_rss_direct(feed_url, source_name):
     deals = []
     try:
         feed = feedparser.parse(feed_url)
         for e in feed.entries[:40]:
-            pub = entry_published(e)
+            pub = entry_dt(e)
             if not is_fresh(pub):
                 continue
             title = e.get("title","").strip()
             url   = e.get("link","")
-            age   = f" [{int((NOW - pub).total_seconds()//3600)}h ago]" if pub else ""
             deals.append({
-                "id":        deal_id(title, url),
-                "title":     title,
-                "url":       url,
-                "source":    source_name,
-                "score":     score_deal(title, e.get("summary","")),
-                "published": pub,
-                "age":       age,
+                "id":     deal_id(title, url),
+                "title":  title,
+                "url":    url,
+                "source": source_name,
+                "score":  score_deal(title, e.get("summary","")),
+                "age":    age_label(pub),
             })
     except Exception as ex:
         logging.warning(f"{source_name} RSS failed: {ex}")
@@ -196,7 +200,7 @@ def fetch_all_rss():
     ]
     all_deals = []
     for url, name in feeds:
-        all_deals += fetch_rss(url, name)
+        all_deals += fetch_rss_direct(url, name)
     return all_deals
 
 def fetch_reddit(subreddit, min_upvotes=10):
@@ -207,85 +211,109 @@ def fetch_reddit(subreddit, min_upvotes=10):
         out = []
         for p in posts:
             d = p["data"]
-
-            # freshness check via created_utc
             created = datetime.fromtimestamp(d.get("created_utc", 0), tz=timezone.utc)
             if not is_fresh(created):
                 continue
-
-            # upvote gate
             upvotes = d.get("score", 0)
             if upvotes < min_upvotes:
                 continue
-
             title = d["title"].strip()
-
-            # r/GameDeals: physical items only
             if subreddit == "GameDeals" and not is_physical_game(title):
                 continue
-
-            age = f" [{int((NOW - created).total_seconds()//3600)}h ago]"
             upvote_bonus = min(upvotes // 20, 15)
             out.append({
-                "id":        deal_id(title, d.get("url","")),
-                "title":     title,
-                "url":       f"https://reddit.com{d['permalink']}",
-                "source":    f"r/{subreddit}",
-                "score":     score_deal(title, d.get("selftext",""), subreddit) + upvote_bonus,
-                "published": created,
-                "age":       age,
+                "id":     deal_id(title, d.get("url","")),
+                "title":  title,
+                "url":    f"https://reddit.com{d['permalink']}",
+                "source": f"r/{subreddit}",
+                "score":  score_deal(title, d.get("selftext",""), subreddit) + upvote_bonus,
+                "age":    age_label(created),
             })
         return out
     except Exception as ex:
         logging.warning(f"Reddit r/{subreddit} failed: {ex}")
         return []
 
-def fetch_twitter_rssbridge():
+def _parse_feed_text(text, account, instance_label):
+    """Parse RSS/Atom text and return deal dicts."""
+    deals = []
+    feed = feedparser.parse(text)
+    for e in feed.entries[:10]:
+        pub = entry_dt(e)
+        if not is_fresh(pub):
+            continue
+        title = e.get("title","").strip()
+        link  = e.get("link","")
+        s = score_deal(title, source=f"@{account}")
+        if s < 5:
+            continue
+        deals.append({
+            "id":     deal_id(title, link),
+            "title":  title,
+            "url":    link,
+            "source": f"Twitter/@{account}",
+            "score":  s + 8,
+            "age":    age_label(pub),
+        })
+    return deals
+
+def fetch_twitter():
     """
-    Fetch deal tweets via public RSSBridge instances (free, no API key).
-    Tries each instance until one works for each account.
+    Try Nitter instances first, then RSSBridge.
+    All requests go through ScraperAPI (residential IPs) to bypass datacenter IP blocks.
     """
     deals = []
     for account in TWITTER_ACCOUNTS:
-        fetched = False
-        for instance in RSSBRIDGE_INSTANCES:
-            try:
-                # RSSBridge Twitter bridge URL format
-                feed_url = (
-                    f"{instance}?action=display&bridge=Twitter"
-                    f"&context=By+username&u={account}&norep=on&format=Atom"
-                )
-                r = SESSION.get(feed_url, timeout=10)
-                if r.status_code != 200 or "<feed" not in r.text[:500] and "<rss" not in r.text[:500]:
-                    continue
-                feed = feedparser.parse(r.text)
-                if not feed.entries:
-                    continue
-                for e in feed.entries[:8]:
-                    pub = entry_published(e)
-                    if not is_fresh(pub):
-                        continue
-                    title = e.get("title","").strip()
-                    link  = e.get("link","")
-                    s = score_deal(title, source=f"@{account}")
-                    if s < 5:
-                        continue
-                    age = f" [{int((NOW - pub).total_seconds()//3600)}h ago]" if pub else ""
-                    deals.append({
-                        "id":        deal_id(title, link),
-                        "title":     title,
-                        "url":       link,
-                        "source":    f"Twitter/@{account}",
-                        "score":     s + 8,
-                        "published": pub,
-                        "age":       age,
-                    })
-                fetched = True
+        account_deals = []
+
+        # 1. Try Nitter instances via ScraperAPI
+        for instance in NITTER_INSTANCES:
+            if account_deals:
                 break
+            try:
+                feed_url = f"{instance}/{account}/rss"
+                if SCRAPER_API_KEY:
+                    r = scraper_get(feed_url)
+                    text = r.text
+                else:
+                    r = SESSION.get(feed_url, timeout=10)
+                    text = r.text
+                if "<rss" not in text[:1000] and "<feed" not in text[:1000]:
+                    continue
+                account_deals = _parse_feed_text(text, account, instance)
+                if account_deals:
+                    logging.info(f"Twitter @{account}: got {len(account_deals)} via {instance}")
             except Exception:
                 continue
-        if not fetched:
-            logging.warning(f"Twitter @{account}: no RSSBridge instance responded")
+
+        # 2. Fallback: RSSBridge via ScraperAPI
+        if not account_deals:
+            for bridge in RSSBRIDGE_INSTANCES:
+                if account_deals:
+                    break
+                try:
+                    feed_url = (
+                        f"{bridge}?action=display&bridge=Twitter"
+                        f"&context=By+username&u={account}&norep=on&format=Atom"
+                    )
+                    if SCRAPER_API_KEY:
+                        r = scraper_get(feed_url)
+                        text = r.text
+                    else:
+                        r = SESSION.get(feed_url, timeout=10)
+                        text = r.text
+                    if "<feed" not in text[:1000] and "<rss" not in text[:1000]:
+                        continue
+                    account_deals = _parse_feed_text(text, account, bridge)
+                    if account_deals:
+                        logging.info(f"Twitter @{account}: got {len(account_deals)} via RSSBridge {bridge}")
+                except Exception:
+                    continue
+
+        if not account_deals:
+            logging.warning(f"Twitter @{account}: all sources failed")
+        deals.extend(account_deals)
+
     return deals
 
 def fetch_amazon_warehouse():
@@ -312,13 +340,12 @@ def fetch_amazon_warehouse():
                 price = price_el.get_text(strip=True) if price_el else ""
                 link  = "https://amazon.com" + link_el["href"] if link_el and link_el.get("href") else url
                 deals.append({
-                    "id":        deal_id(title, link),
-                    "title":     f"[WH-{cat_name}] {title[:90]} — {price}",
-                    "url":       link,
-                    "source":    "Amazon Warehouse",
-                    "score":     score_deal(f"{title} amazon warehouse {cat_name}") + 15,
-                    "published": None,
-                    "age":       "",
+                    "id":     deal_id(title, link),
+                    "title":  f"[WH-{cat_name}] {title[:90]} — {price}",
+                    "url":    link,
+                    "source": "Amazon Warehouse",
+                    "score":  score_deal(f"{title} amazon warehouse {cat_name}") + 15,
+                    "age":    "",
                 })
         except Exception as ex:
             logging.warning(f"Amazon Warehouse ({cat_name}) failed: {ex}")
@@ -337,13 +364,12 @@ def fetch_ccc_watchlist():
             price_num = float(raw) if raw else 9999
             if price_num <= max_price:
                 deals.append({
-                    "id":        deal_id(label, asin),
-                    "title":     f"WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
-                    "url":       f"https://www.amazon.com/dp/{asin}",
-                    "source":    "CamelCamelCamel",
-                    "score":     90,
-                    "published": NOW,
-                    "age":       "",
+                    "id":     deal_id(label, asin),
+                    "title":  f"WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
+                    "url":    f"https://www.amazon.com/dp/{asin}",
+                    "source": "CamelCamelCamel",
+                    "score":  90,
+                    "age":    " [now]",
                 })
         except Exception as ex:
             logging.warning(f"CCC {asin} failed: {ex}")
@@ -422,7 +448,7 @@ def recommend(deal):
     roi_lines = []
     if deal_price and ap and ap > 0:
         margin  = ap - deal_price
-        roi_pct = (margin / deal_price * 100)
+        roi_pct = margin / deal_price * 100
         roi_lines.append(f"Deal ${deal_price:.0f} → Amazon ${ap:.0f}  (+${margin:.0f} / {roi_pct:.0f}% ROI)")
     if es:
         suffix = f"  (+${es - deal_price:.0f} vs deal)" if deal_price else ""
@@ -465,12 +491,9 @@ def send_message(text):
     )
     time.sleep(0.4)
 
-def send_summary_header(count, fresh_window):
+def send_summary_header(count):
     ts = NOW.strftime("%-I:%M %p UTC · %b %-d")
-    send_message(
-        f"🔎 <b>Deal Hunt — {ts}</b>\n"
-        f"{count} candidates  ·  last {fresh_window}h only"
-    )
+    send_message(f"🔎 <b>Deal Hunt — {ts}</b>\n{count} new candidates")
 
 def send_deal_card(deal, verdict, reason, roi_lines, index, total):
     lines = [
@@ -497,14 +520,14 @@ def main():
     all_deals += fetch_all_rss()
     for sub, min_up in REDDIT_SUBS.items():
         all_deals += fetch_reddit(sub, min_upvotes=min_up)
-    all_deals += fetch_twitter_rssbridge()
+    all_deals += fetch_twitter()
     all_deals += fetch_amazon_warehouse()
     all_deals += fetch_ccc_watchlist()
 
     source_counts = {}
     for d in all_deals:
         source_counts[d["source"]] = source_counts.get(d["source"], 0) + 1
-    logging.info(f"Fetched {len(all_deals)} (≤{MAX_AGE_HOURS}h fresh) from: {source_counts}")
+    logging.info(f"Fetched {len(all_deals)} (≤{MAX_AGE_HOURS}h) from: {source_counts}")
 
     new_deals = [d for d in all_deals if d["id"] not in seen]
     logging.info(f"  {len(new_deals)} new since last run")
@@ -518,7 +541,7 @@ def main():
     new_seen = {d["id"] for d in new_deals}
 
     if not candidates:
-        logging.info("No candidates")
+        logging.info("No candidates — skipping Telegram")
         save_seen(seen | new_seen)
         return
 
@@ -534,7 +557,7 @@ def main():
     if len(final) < 5:
         final += passes[:5 - len(final)]
 
-    send_summary_header(len(final), MAX_AGE_HOURS)
+    send_summary_header(len(final))
     for i, (deal, verdict, reason, roi_lines) in enumerate(final, 1):
         send_deal_card(deal, verdict, reason, roi_lines, i, len(final))
 
