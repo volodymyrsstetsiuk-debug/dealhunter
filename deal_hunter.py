@@ -1,11 +1,14 @@
 """
-deal_hunter.py  v4
-Fixes: seen.json write perms (workflow), Nitter replaced with reliable RSS,
-       Amazon + eBay sold price comparison restored, one Telegram message per deal.
+deal_hunter.py  v5
+- Freshness: all sources filtered to last 36h only
+- Reddit: min upvotes enforced, digital-only deals skipped, r/GameDeals physical-only
+- Twitter: RSSBridge public instances (free, no API key needed)
+- Amazon + eBay sold price enrichment
+- One Telegram card per deal
 """
 
 import os, json, re, time, hashlib, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 import feedparser
@@ -17,7 +20,9 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SCRAPER_API_KEY  = os.environ.get("SCRAPER_API_KEY", "")
 SEEN_FILE        = "seen.json"
 MIN_SCORE        = 15
+MAX_AGE_HOURS    = 36   # ignore anything older than this
 
+# ── keywords ───────────────────────────────────────────────────────────────────
 KEYWORDS_BOOST = [
     "lego","pokemon","pokémon","nintendo","switch","ps5","xbox","playstation",
     "apple","ipad","airpods","macbook","iphone","dyson","keurig","instant pot",
@@ -31,6 +36,32 @@ KEYWORDS_BOOST = [
 KEYWORDS_SKIP = [
     "porn","adult","casino","gambling","cbd","vape","tobacco",
     "crypto","nft","insurance","mortgage","loan","forex",
+    # digital-only signals (no physical product to flip)
+    "steam key","steam code","epic games","xbox game pass","ps plus",
+    "playstation plus","humble bundle","digital code","digital download",
+    "google play credit","app store credit","ebook","kindle",
+]
+
+# Reddit: subreddits + their minimum upvote threshold
+REDDIT_SUBS = {
+    "deals":         50,   # high noise, require engagement
+    "Flipping":      10,
+    "buildapcsales": 30,
+    "MUAontheCheap": 20,
+    "flipping":      10,
+    # GameDeals kept but physical-only filter applied below
+    "GameDeals":     100,
+}
+
+# Twitter accounts → fetched via RSSBridge (no API key needed)
+TWITTER_ACCOUNTS = [
+    "Pricerrors", "DealsPlus", "GottaDEAL", "DealNews", "SlickdealsNet",
+    "1saleaday", "bradsdeals", "dealnews",
+]
+RSSBRIDGE_INSTANCES = [
+    "https://rssbridge.flossxyz.com/",
+    "https://wtf.roflcopter.fr/rss/",
+    "https://rss-bridge.org/bridge01/",
 ]
 
 # CamelCamelCamel watchlist: (ASIN, max_price, label)
@@ -40,6 +71,9 @@ CCC_WATCHLIST = [
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+NOW = datetime.now(timezone.utc)
+CUTOFF = NOW - timedelta(hours=MAX_AGE_HOURS)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -73,6 +107,24 @@ def save_seen(seen):
 def deal_id(title, url=""):
     return hashlib.md5((title + url).encode()).hexdigest()[:12]
 
+def is_fresh(dt):
+    """dt should be a timezone-aware datetime. Returns True if within MAX_AGE_HOURS."""
+    if dt is None:
+        return True  # no date info → don't filter out
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt >= CUTOFF
+
+def entry_published(entry):
+    """Extract published datetime from a feedparser entry."""
+    tp = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not tp:
+        return None
+    try:
+        return datetime(*tp[:6], tzinfo=timezone.utc)
+    except Exception:
+        return None
+
 def score_deal(title, body="", source=""):
     t = (title + " " + body + " " + source).lower()
     if any(k in t for k in KEYWORDS_SKIP):
@@ -93,6 +145,15 @@ def score_deal(title, body="", source=""):
         s += 10
     return s
 
+def is_physical_game(title):
+    """For r/GameDeals: only pass physical/collector items, not digital keys."""
+    t = title.lower()
+    physical_signals = ["physical","collector","limited edition","steelbook","box","cartridge","disc"]
+    digital_signals  = ["dlc","season pass","digital","key","code","subscription","membership","psn","xbl","pc "]
+    if any(d in t for d in digital_signals):
+        return False
+    return any(p in t for p in physical_signals)
+
 
 # ── sources ────────────────────────────────────────────────────────────────────
 
@@ -100,15 +161,21 @@ def fetch_rss(feed_url, source_name):
     deals = []
     try:
         feed = feedparser.parse(feed_url)
-        for e in feed.entries[:30]:
+        for e in feed.entries[:40]:
+            pub = entry_published(e)
+            if not is_fresh(pub):
+                continue
             title = e.get("title","").strip()
             url   = e.get("link","")
+            age   = f" [{int((NOW - pub).total_seconds()//3600)}h ago]" if pub else ""
             deals.append({
-                "id":     deal_id(title, url),
-                "title":  title,
-                "url":    url,
-                "source": source_name,
-                "score":  score_deal(title, e.get("summary","")),
+                "id":        deal_id(title, url),
+                "title":     title,
+                "url":       url,
+                "source":    source_name,
+                "score":     score_deal(title, e.get("summary","")),
+                "published": pub,
+                "age":       age,
             })
     except Exception as ex:
         logging.warning(f"{source_name} RSS failed: {ex}")
@@ -118,13 +185,13 @@ def fetch_all_rss():
     feeds = [
         ("https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1", "Slickdeals-FP"),
         ("https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1",  "Slickdeals-Pop"),
-        ("https://9to5toys.com/feed/",           "9to5Toys"),
-        ("https://9to5mac.com/deals/feed/",      "9to5Mac-Deals"),
-        ("https://www.bensbargains.com/feed/",   "BensBargains"),
-        ("https://dealnews.com/rss.html",        "DealNews"),
-        ("https://www.gottadeal.com/feed",       "GottaDEAL"),
-        ("https://www.dealsplus.com/feed",       "DealsPlus"),
-        ("https://hip2save.com/feed/",           "Hip2Save"),
+        ("https://9to5toys.com/feed/",              "9to5Toys"),
+        ("https://9to5mac.com/deals/feed/",         "9to5Mac"),
+        ("https://www.bensbargains.com/feed/",      "BensBargains"),
+        ("https://dealnews.com/rss.html",           "DealNews"),
+        ("https://www.gottadeal.com/feed",          "GottaDEAL"),
+        ("https://www.dealsplus.com/feed",          "DealsPlus"),
+        ("https://hip2save.com/feed/",              "Hip2Save"),
         ("https://www.techbargains.com/feed/rss2/", "TechBargains"),
     ]
     all_deals = []
@@ -132,26 +199,94 @@ def fetch_all_rss():
         all_deals += fetch_rss(url, name)
     return all_deals
 
-def fetch_reddit(subreddit):
-    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
+def fetch_reddit(subreddit, min_upvotes=10):
+    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=50"
     try:
         r = scraper_get(url)
         posts = r.json()["data"]["children"]
         out = []
         for p in posts:
             d = p["data"]
-            upvote_bonus = min(d.get("score", 0) // 20, 15)
+
+            # freshness check via created_utc
+            created = datetime.fromtimestamp(d.get("created_utc", 0), tz=timezone.utc)
+            if not is_fresh(created):
+                continue
+
+            # upvote gate
+            upvotes = d.get("score", 0)
+            if upvotes < min_upvotes:
+                continue
+
+            title = d["title"].strip()
+
+            # r/GameDeals: physical items only
+            if subreddit == "GameDeals" and not is_physical_game(title):
+                continue
+
+            age = f" [{int((NOW - created).total_seconds()//3600)}h ago]"
+            upvote_bonus = min(upvotes // 20, 15)
             out.append({
-                "id":     deal_id(d["title"], d.get("url","")),
-                "title":  d["title"].strip(),
-                "url":    f"https://reddit.com{d['permalink']}",
-                "source": f"r/{subreddit}",
-                "score":  score_deal(d["title"], d.get("selftext",""), subreddit) + upvote_bonus,
+                "id":        deal_id(title, d.get("url","")),
+                "title":     title,
+                "url":       f"https://reddit.com{d['permalink']}",
+                "source":    f"r/{subreddit}",
+                "score":     score_deal(title, d.get("selftext",""), subreddit) + upvote_bonus,
+                "published": created,
+                "age":       age,
             })
         return out
     except Exception as ex:
         logging.warning(f"Reddit r/{subreddit} failed: {ex}")
         return []
+
+def fetch_twitter_rssbridge():
+    """
+    Fetch deal tweets via public RSSBridge instances (free, no API key).
+    Tries each instance until one works for each account.
+    """
+    deals = []
+    for account in TWITTER_ACCOUNTS:
+        fetched = False
+        for instance in RSSBRIDGE_INSTANCES:
+            try:
+                # RSSBridge Twitter bridge URL format
+                feed_url = (
+                    f"{instance}?action=display&bridge=Twitter"
+                    f"&context=By+username&u={account}&norep=on&format=Atom"
+                )
+                r = SESSION.get(feed_url, timeout=10)
+                if r.status_code != 200 or "<feed" not in r.text[:500] and "<rss" not in r.text[:500]:
+                    continue
+                feed = feedparser.parse(r.text)
+                if not feed.entries:
+                    continue
+                for e in feed.entries[:8]:
+                    pub = entry_published(e)
+                    if not is_fresh(pub):
+                        continue
+                    title = e.get("title","").strip()
+                    link  = e.get("link","")
+                    s = score_deal(title, source=f"@{account}")
+                    if s < 5:
+                        continue
+                    age = f" [{int((NOW - pub).total_seconds()//3600)}h ago]" if pub else ""
+                    deals.append({
+                        "id":        deal_id(title, link),
+                        "title":     title,
+                        "url":       link,
+                        "source":    f"Twitter/@{account}",
+                        "score":     s + 8,
+                        "published": pub,
+                        "age":       age,
+                    })
+                fetched = True
+                break
+            except Exception:
+                continue
+        if not fetched:
+            logging.warning(f"Twitter @{account}: no RSSBridge instance responded")
+    return deals
 
 def fetch_amazon_warehouse():
     if not SCRAPER_API_KEY:
@@ -177,11 +312,13 @@ def fetch_amazon_warehouse():
                 price = price_el.get_text(strip=True) if price_el else ""
                 link  = "https://amazon.com" + link_el["href"] if link_el and link_el.get("href") else url
                 deals.append({
-                    "id":     deal_id(title, link),
-                    "title":  f"[WH-{cat_name}] {title[:90]} — {price}",
-                    "url":    link,
-                    "source": "Amazon Warehouse",
-                    "score":  score_deal(f"{title} amazon warehouse {cat_name}") + 15,
+                    "id":        deal_id(title, link),
+                    "title":     f"[WH-{cat_name}] {title[:90]} — {price}",
+                    "url":       link,
+                    "source":    "Amazon Warehouse",
+                    "score":     score_deal(f"{title} amazon warehouse {cat_name}") + 15,
+                    "published": None,
+                    "age":       "",
                 })
         except Exception as ex:
             logging.warning(f"Amazon Warehouse ({cat_name}) failed: {ex}")
@@ -200,11 +337,13 @@ def fetch_ccc_watchlist():
             price_num = float(raw) if raw else 9999
             if price_num <= max_price:
                 deals.append({
-                    "id":     deal_id(label, asin),
-                    "title":  f"WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
-                    "url":    f"https://www.amazon.com/dp/{asin}",
-                    "source": "CamelCamelCamel",
-                    "score":  90,
+                    "id":        deal_id(label, asin),
+                    "title":     f"WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
+                    "url":       f"https://www.amazon.com/dp/{asin}",
+                    "source":    "CamelCamelCamel",
+                    "score":     90,
+                    "published": NOW,
+                    "age":       "",
                 })
         except Exception as ex:
             logging.warning(f"CCC {asin} failed: {ex}")
@@ -214,7 +353,6 @@ def fetch_ccc_watchlist():
 # ── price enrichment ───────────────────────────────────────────────────────────
 
 def get_amazon_price(query):
-    """Returns (price_float, product_url) or (None, None)."""
     if not SCRAPER_API_KEY:
         return None, None
     try:
@@ -235,7 +373,6 @@ def get_amazon_price(query):
         return None, None
 
 def get_ebay_sold_avg(query):
-    """Returns average sold price from eBay completed listings, or None."""
     try:
         search_url = (
             f"https://www.ebay.com/sch/i.html?_nkw={requests.utils.quote(query[:60])}"
@@ -273,7 +410,6 @@ def enrich(deal):
 # ── recommender ────────────────────────────────────────────────────────────────
 
 def recommend(deal):
-    """Returns (verdict, reason, roi_lines)."""
     title  = deal["title"].lower()
     score  = deal["score"]
     source = deal["source"]
@@ -284,30 +420,24 @@ def recommend(deal):
     deal_price = float(price_m.group(1).replace(",","")) if price_m else None
 
     roi_lines = []
-    if deal_price and ap:
+    if deal_price and ap and ap > 0:
         margin  = ap - deal_price
-        roi_pct = (margin / deal_price * 100) if deal_price else 0
+        roi_pct = (margin / deal_price * 100)
         roi_lines.append(f"Deal ${deal_price:.0f} → Amazon ${ap:.0f}  (+${margin:.0f} / {roi_pct:.0f}% ROI)")
     if es:
-        if deal_price:
-            roi_lines.append(f"eBay sold avg ${es:.0f}  (+${es - deal_price:.0f} vs deal price)")
-        else:
-            roi_lines.append(f"eBay sold avg ${es:.0f}")
+        suffix = f"  (+${es - deal_price:.0f} vs deal)" if deal_price else ""
+        roi_lines.append(f"eBay sold avg ${es:.0f}{suffix}")
 
     if source == "CamelCamelCamel":
         return "BUY 🟢", "Watchlist target hit", roi_lines
-
     if any(x in title for x in ["price error","pricing error","glitch","mistake price"]):
-        return "BUY 🟢", "Price error — act NOW, expires in minutes", roi_lines
-
+        return "BUY 🟢", "Price error — act NOW, expires fast", roi_lines
     if deal_price and ap and ap / deal_price >= 2.5:
         return "BUY 🟢", f"3× rule: Amazon is {ap/deal_price:.1f}× the deal price", roi_lines
-
     if deal_price and es and es / deal_price >= 2.0:
         return "BUY 🟢", f"eBay sold avg is {es/deal_price:.1f}× the deal price", roi_lines
-
     if source == "Amazon Warehouse" and score >= 30:
-        return "BUY 🟢", "Warehouse deal — check condition grade", roi_lines
+        return "BUY 🟢", "Warehouse deal — verify condition grade", roi_lines
 
     pct_m = re.search(r'(\d+)\s*%\s*off', title)
     pct   = int(pct_m.group(1)) if pct_m else 0
@@ -335,17 +465,16 @@ def send_message(text):
     )
     time.sleep(0.4)
 
-def send_summary_header(count, source_summary):
-    ts = datetime.now(timezone.utc).strftime("%-I:%M %p UTC · %b %-d")
+def send_summary_header(count, fresh_window):
+    ts = NOW.strftime("%-I:%M %p UTC · %b %-d")
     send_message(
         f"🔎 <b>Deal Hunt — {ts}</b>\n"
-        f"{count} candidates found\n"
-        f"<i>{source_summary}</i>"
+        f"{count} candidates  ·  last {fresh_window}h only"
     )
 
 def send_deal_card(deal, verdict, reason, roi_lines, index, total):
     lines = [
-        f"{verdict}  <b>[{index}/{total}] {deal['title'][:110]}</b>",
+        f"{verdict}  <b>[{index}/{total}]{deal['age']} {deal['title'][:110]}</b>",
         f"",
         f"📌 {deal['source']}  ·  score {deal['score']}",
         f"💡 {reason}",
@@ -366,15 +495,16 @@ def main():
 
     all_deals = []
     all_deals += fetch_all_rss()
-    for sub in ["deals","Flipping","GameDeals","buildapcsales","MUAontheCheap","flipping"]:
-        all_deals += fetch_reddit(sub)
+    for sub, min_up in REDDIT_SUBS.items():
+        all_deals += fetch_reddit(sub, min_upvotes=min_up)
+    all_deals += fetch_twitter_rssbridge()
     all_deals += fetch_amazon_warehouse()
     all_deals += fetch_ccc_watchlist()
 
     source_counts = {}
     for d in all_deals:
         source_counts[d["source"]] = source_counts.get(d["source"], 0) + 1
-    logging.info(f"Fetched {len(all_deals)} from: {source_counts}")
+    logging.info(f"Fetched {len(all_deals)} (≤{MAX_AGE_HOURS}h fresh) from: {source_counts}")
 
     new_deals = [d for d in all_deals if d["id"] not in seen]
     logging.info(f"  {len(new_deals)} new since last run")
@@ -395,18 +525,16 @@ def main():
     for d in candidates:
         enrich(d)
 
-    rated = [(d, *recommend(d)) for d in candidates]
-    buys  = [(d,v,r,roi) for d,v,r,roi in rated if "BUY"   in v]
-    watch = [(d,v,r,roi) for d,v,r,roi in rated if "WATCH" in v]
-    passes= [(d,v,r,roi) for d,v,r,roi in rated if "PASS"  in v]
+    rated  = [(d, *recommend(d)) for d in candidates]
+    buys   = [(d,v,r,roi) for d,v,r,roi in rated if "BUY"   in v]
+    watch  = [(d,v,r,roi) for d,v,r,roi in rated if "WATCH" in v]
+    passes = [(d,v,r,roi) for d,v,r,roi in rated if "PASS"  in v]
 
     final = buys + watch
     if len(final) < 5:
         final += passes[:5 - len(final)]
 
-    top_sources = ", ".join(list(source_counts.keys())[:5])
-    send_summary_header(len(final), top_sources)
-
+    send_summary_header(len(final), MAX_AGE_HOURS)
     for i, (deal, verdict, reason, roi_lines) in enumerate(final, 1):
         send_deal_card(deal, verdict, reason, roi_lines, i, len(final))
 
