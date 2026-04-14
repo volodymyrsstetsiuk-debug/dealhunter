@@ -1,7 +1,7 @@
 """
-deal_hunter.py  v3 — multi-source deal scanner with buy/watch/pass recommender
-Sources: Slickdeals RSS · Reddit (via ScraperAPI) · Nitter/Twitter RSS ·
-         Amazon Warehouse (ScraperAPI) · CamelCamelCamel watchlist · Brickseek clearance
+deal_hunter.py  v4
+Fixes: seen.json write perms (workflow), Nitter replaced with reliable RSS,
+       Amazon + eBay sold price comparison restored, one Telegram message per deal.
 """
 
 import os, json, re, time, hashlib, logging
@@ -12,14 +12,12 @@ import feedparser
 
 logging.basicConfig(level=logging.INFO, format="%(lineno)d %(message)s")
 
-# ── secrets ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SCRAPER_API_KEY  = os.environ.get("SCRAPER_API_KEY", "")
 SEEN_FILE        = "seen.json"
 MIN_SCORE        = 15
 
-# ── keyword config ─────────────────────────────────────────────────────────────
 KEYWORDS_BOOST = [
     "lego","pokemon","pokémon","nintendo","switch","ps5","xbox","playstation",
     "apple","ipad","airpods","macbook","iphone","dyson","keurig","instant pot",
@@ -35,38 +33,26 @@ KEYWORDS_SKIP = [
     "crypto","nft","insurance","mortgage","loan","forex",
 ]
 
-# ── Nitter accounts (price errors + deal scouts) ───────────────────────────────
-NITTER_MIRRORS = [
-    "https://nitter.privacydev.net",
-    "https://nitter.poast.org",
-    "https://nitter.net",
-]
-TWITTER_ACCOUNTS = [
-    "Pricerrors", "DealsPlus", "lootbot_deals", "GottaDEAL",
-    "dealsource_mel", "SlickdealsNet", "1saleaday", "TechDealBlog",
-    "DealNews", "MaximumDeals",
+# CamelCamelCamel watchlist: (ASIN, max_price, label)
+CCC_WATCHLIST = [
+    # ("B08N5WRWNW", 80, "LEGO Millennium Falcon"),
 ]
 
-# ── CamelCamelCamel watchlist ─────────────────────────────────────────────────
-# Add tuples: (ASIN, max_price_you_will_pay, label)
-CCC_WATCHLIST = [
-    # ("B08N5WRWNW", 80,  "LEGO Millennium Falcon"),
-    # ("B07XJ8C8F5", 40,  "Switch Pro Controller"),
-]
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def scraper_get(url, retries=2, **params):
-    """Route through ScraperAPI if key is set, else direct with UA header."""
     for attempt in range(retries + 1):
         try:
             if SCRAPER_API_KEY:
                 p = {"api_key": SCRAPER_API_KEY, "url": url}
                 p.update(params)
-                r = requests.get("https://api.scraperapi.com/", params=p, timeout=45)
+                r = SESSION.get("https://api.scraperapi.com/", params=p, timeout=45)
             else:
-                headers = {"User-Agent": "Mozilla/5.0 (compatible; DealHunterBot/3.0)"}
-                r = requests.get(url, headers=headers, timeout=20)
+                r = SESSION.get(url, timeout=20)
             r.raise_for_status()
             return r
         except Exception as ex:
@@ -99,7 +85,7 @@ def score_deal(title, body="", source=""):
     if m:
         p = int(m.group(1))
         s += 25 if p >= 70 else 18 if p >= 55 else 10 if p >= 40 else 4 if p >= 25 else 0
-    if any(x in t for x in ["price error", "pricing error", "glitch", "mistake price"]):
+    if any(x in t for x in ["price error","pricing error","glitch","mistake price"]):
         s += 35
     if "amazon warehouse" in t or "open box" in t:
         s += 15
@@ -110,31 +96,43 @@ def score_deal(title, body="", source=""):
 
 # ── sources ────────────────────────────────────────────────────────────────────
 
-def fetch_slickdeals():
+def fetch_rss(feed_url, source_name):
     deals = []
-    feeds = [
-        "https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1",
-        "https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1",
-    ]
-    for feed_url in feeds:
-        try:
-            feed = feedparser.parse(feed_url)
-            for e in feed.entries[:30]:
-                deals.append({
-                    "id":     deal_id(e.get("title",""), e.get("link","")),
-                    "title":  e.get("title","").strip(),
-                    "url":    e.get("link",""),
-                    "source": "Slickdeals",
-                    "score":  score_deal(e.get("title",""), e.get("summary","")),
-                    "price_hint": "",
-                })
-        except Exception as ex:
-            logging.warning(f"Slickdeals failed: {ex}")
+    try:
+        feed = feedparser.parse(feed_url)
+        for e in feed.entries[:30]:
+            title = e.get("title","").strip()
+            url   = e.get("link","")
+            deals.append({
+                "id":     deal_id(title, url),
+                "title":  title,
+                "url":    url,
+                "source": source_name,
+                "score":  score_deal(title, e.get("summary","")),
+            })
+    except Exception as ex:
+        logging.warning(f"{source_name} RSS failed: {ex}")
     return deals
 
+def fetch_all_rss():
+    feeds = [
+        ("https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1", "Slickdeals-FP"),
+        ("https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1",  "Slickdeals-Pop"),
+        ("https://9to5toys.com/feed/",           "9to5Toys"),
+        ("https://9to5mac.com/deals/feed/",      "9to5Mac-Deals"),
+        ("https://www.bensbargains.com/feed/",   "BensBargains"),
+        ("https://dealnews.com/rss.html",        "DealNews"),
+        ("https://www.gottadeal.com/feed",       "GottaDEAL"),
+        ("https://www.dealsplus.com/feed",       "DealsPlus"),
+        ("https://hip2save.com/feed/",           "Hip2Save"),
+        ("https://www.techbargains.com/feed/rss2/", "TechBargains"),
+    ]
+    all_deals = []
+    for url, name in feeds:
+        all_deals += fetch_rss(url, name)
+    return all_deals
 
 def fetch_reddit(subreddit):
-    """Fetch subreddit new posts via ScraperAPI to avoid 403s."""
     url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
     try:
         r = scraper_get(url)
@@ -149,63 +147,21 @@ def fetch_reddit(subreddit):
                 "url":    f"https://reddit.com{d['permalink']}",
                 "source": f"r/{subreddit}",
                 "score":  score_deal(d["title"], d.get("selftext",""), subreddit) + upvote_bonus,
-                "price_hint": "",
             })
         return out
     except Exception as ex:
         logging.warning(f"Reddit r/{subreddit} failed: {ex}")
         return []
 
-
-def fetch_nitter():
-    """Pull recent deal tweets via Nitter RSS (free X mirrors)."""
-    deals = []
-    for account in TWITTER_ACCOUNTS:
-        feed_url = None
-        for mirror in NITTER_MIRRORS:
-            try:
-                test = f"{mirror}/{account}/rss"
-                r = requests.get(test, timeout=8, headers={"User-Agent": "feedparser/6.0"})
-                if r.status_code == 200 and "<rss" in r.text[:500]:
-                    feed_url = test
-                    break
-            except Exception:
-                continue
-        if not feed_url:
-            logging.warning(f"Nitter: no working mirror for @{account}")
-            continue
-        try:
-            feed = feedparser.parse(feed_url)
-            for e in feed.entries[:12]:
-                title = e.get("title","").strip()
-                link  = e.get("link","")
-                s = score_deal(title, source=f"@{account}")
-                if s < 5:
-                    continue
-                deals.append({
-                    "id":     deal_id(title, link),
-                    "title":  f"{title[:130]}",
-                    "url":    link,
-                    "source": f"Twitter/@{account}",
-                    "score":  s + 8,  # bonus: real-time, often before Slickdeals
-                    "price_hint": "",
-                })
-        except Exception as ex:
-            logging.warning(f"Nitter @{account} failed: {ex}")
-    return deals
-
-
 def fetch_amazon_warehouse():
-    """Scrape Amazon Warehouse deals categories via ScraperAPI."""
     if not SCRAPER_API_KEY:
-        logging.info("Skipping Amazon Warehouse (no SCRAPER_API_KEY)")
         return []
     deals = []
     categories = [
-        ("Electronics",  "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A172282&s=date-desc-rank"),
-        ("Toys",         "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A165793011&s=date-desc-rank"),
-        ("Tools",        "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A228013&s=date-desc-rank"),
-        ("Video Games",  "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A468642&s=date-desc-rank"),
+        ("Electronics", "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A172282&s=date-desc-rank"),
+        ("Toys",        "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A165793011&s=date-desc-rank"),
+        ("Tools",       "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A228013&s=date-desc-rank"),
+        ("Games",       "https://www.amazon.com/s?i=warehouse-deals&rh=n%3A468642&s=date-desc-rank"),
     ]
     for cat_name, url in categories:
         try:
@@ -215,37 +171,27 @@ def fetch_amazon_warehouse():
                 title_el = item.select_one("h2 a span")
                 price_el = item.select_one(".a-price .a-offscreen")
                 link_el  = item.select_one("h2 a")
-                cond_el  = item.select_one(".a-color-secondary")
                 if not title_el:
                     continue
                 title = title_el.get_text(strip=True)
                 price = price_el.get_text(strip=True) if price_el else ""
                 link  = "https://amazon.com" + link_el["href"] if link_el and link_el.get("href") else url
-                cond  = cond_el.get_text(strip=True)[:60] if cond_el else ""
-                full  = f"{title} amazon warehouse {cat_name} {cond}"
                 deals.append({
-                    "id":         deal_id(title, link),
-                    "title":      f"[WH-{cat_name}] {title[:90]} — {price}",
-                    "url":        link,
-                    "source":     "Amazon Warehouse",
-                    "score":      score_deal(full) + 15,
-                    "price_hint": price,
+                    "id":     deal_id(title, link),
+                    "title":  f"[WH-{cat_name}] {title[:90]} — {price}",
+                    "url":    link,
+                    "source": "Amazon Warehouse",
+                    "score":  score_deal(f"{title} amazon warehouse {cat_name}") + 15,
                 })
         except Exception as ex:
             logging.warning(f"Amazon Warehouse ({cat_name}) failed: {ex}")
     return deals
 
-
 def fetch_ccc_watchlist():
-    """Check CamelCamelCamel for watchlist ASIN price targets."""
     deals = []
     for asin, max_price, label in CCC_WATCHLIST:
         try:
-            r = requests.get(
-                f"https://camelcamelcamel.com/product/{asin}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
-            )
+            r = SESSION.get(f"https://camelcamelcamel.com/product/{asin}", timeout=15)
             soup = BeautifulSoup(r.text, "html.parser")
             price_el = soup.select_one(".amazon .price")
             if not price_el:
@@ -254,123 +200,162 @@ def fetch_ccc_watchlist():
             price_num = float(raw) if raw else 9999
             if price_num <= max_price:
                 deals.append({
-                    "id":         deal_id(label, asin),
-                    "title":      f"⚡ WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
-                    "url":        f"https://www.amazon.com/dp/{asin}",
-                    "source":     "CamelCamelCamel",
-                    "score":      90,
-                    "price_hint": f"${price_num:.2f}",
+                    "id":     deal_id(label, asin),
+                    "title":  f"WATCHLIST HIT: {label} — now ${price_num:.2f} (target ≤${max_price})",
+                    "url":    f"https://www.amazon.com/dp/{asin}",
+                    "source": "CamelCamelCamel",
+                    "score":  90,
                 })
         except Exception as ex:
-            logging.warning(f"CCC {asin} ({label}) failed: {ex}")
+            logging.warning(f"CCC {asin} failed: {ex}")
     return deals
 
 
-def fetch_brickseek():
-    """Scan Brickseek for Target/Walmart clearance finds."""
+# ── price enrichment ───────────────────────────────────────────────────────────
+
+def get_amazon_price(query):
+    """Returns (price_float, product_url) or (None, None)."""
     if not SCRAPER_API_KEY:
-        logging.info("Skipping Brickseek (no SCRAPER_API_KEY)")
-        return []
-    deals = []
-    targets = [
-        ("Target",  "https://brickseek.com/target-inventory-checker/?sku=&type=clearance"),
-        ("Walmart", "https://brickseek.com/walmart-inventory-checker/?sku=&type=clearance"),
-    ]
-    for store, url in targets:
-        try:
-            r = scraper_get(url)
-            soup = BeautifulSoup(r.text, "html.parser")
-            selectors = [".item-results__item", ".product-card", ".clearance-item"]
-            rows = []
-            for sel in selectors:
-                rows = soup.select(sel)
-                if rows:
-                    break
-            for row in rows[:12]:
-                title_el = row.select_one(
-                    ".item-results__name, .product-title, .product-name, h3, h2"
-                )
-                price_el = row.select_one(".price, .item-results__price, .sale-price")
-                pct_el   = row.select_one(".item-results__discount, .discount, .savings")
-                if not title_el:
-                    continue
-                title = title_el.get_text(strip=True)
-                price = price_el.get_text(strip=True) if price_el else ""
-                pct   = pct_el.get_text(strip=True) if pct_el else ""
-                s = score_deal(f"{title} clearance {pct}")
-                if s < 10:
-                    continue
-                deals.append({
-                    "id":         deal_id(title + store),
-                    "title":      f"[{store} Clearance] {title[:90]} {price} {pct}".strip(),
-                    "url":        url,
-                    "source":     f"Brickseek/{store}",
-                    "score":      s + 10,
-                    "price_hint": price,
-                })
-        except Exception as ex:
-            logging.warning(f"Brickseek {store} failed: {ex}")
-    return deals
+        return None, None
+    try:
+        url = f"https://www.amazon.com/s?k={requests.utils.quote(query[:60])}"
+        r = scraper_get(url)
+        soup = BeautifulSoup(r.text, "html.parser")
+        result = soup.select_one("[data-component-type='s-search-result']")
+        if not result:
+            return None, None
+        price_el = result.select_one(".a-price .a-offscreen")
+        link_el  = result.select_one("h2 a")
+        if not price_el:
+            return None, None
+        price = float(re.sub(r"[^\d.]", "", price_el.get_text()) or "0")
+        link  = "https://amazon.com" + link_el["href"] if link_el and link_el.get("href") else ""
+        return price, link
+    except Exception:
+        return None, None
+
+def get_ebay_sold_avg(query):
+    """Returns average sold price from eBay completed listings, or None."""
+    try:
+        search_url = (
+            f"https://www.ebay.com/sch/i.html?_nkw={requests.utils.quote(query[:60])}"
+            "&LH_Complete=1&LH_Sold=1&_sop=13"
+        )
+        r = scraper_get(search_url) if SCRAPER_API_KEY else SESSION.get(search_url, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        prices = []
+        for el in soup.select(".s-item__price")[:12]:
+            raw = re.sub(r"[^\d.]", "", el.get_text().split("to")[0])
+            try:
+                prices.append(float(raw))
+            except Exception:
+                pass
+        if not prices:
+            return None
+        prices.sort()
+        trim = max(1, len(prices) // 7)
+        trimmed = prices[trim:-trim] if len(prices) > 4 else prices
+        return round(sum(trimmed) / len(trimmed), 2)
+    except Exception:
+        return None
+
+def enrich(deal):
+    query = re.sub(r'^\[.*?\]\s*', '', deal["title"])
+    query = re.sub(r'\s*[-—]\s*\$[\d.,]+.*$', '', query).strip()[:70]
+    amazon_price, amazon_url = get_amazon_price(query)
+    ebay_sold = get_ebay_sold_avg(query)
+    deal["amazon_price"] = amazon_price
+    deal["amazon_url"]   = amazon_url or ""
+    deal["ebay_sold"]    = ebay_sold
+    return deal
 
 
-# ── buy/watch/pass recommender ─────────────────────────────────────────────────
+# ── recommender ────────────────────────────────────────────────────────────────
 
 def recommend(deal):
-    """
-    Returns (verdict_str, reason_str).
-    Verdict: BUY 🟢 | WATCH 🟡 | PASS 🔴
-
-    Rules (in priority order):
-    1. CCC watchlist hit → always BUY (you set the price, trust yourself)
-    2. "Price error / glitch" signal → BUY (act immediately, expires fast)
-    3. Amazon Warehouse + relevant category + score ≥ 30 → BUY
-    4. ≥ 60% off + score ≥ 30 → BUY (run Keepa before purchasing)
-    5. ≥ 40% off OR score ≥ 35 → WATCH
-    6. score ≥ 20 → WATCH (soft signal, manual glance)
-    7. else → PASS
-    """
+    """Returns (verdict, reason, roi_lines)."""
     title  = deal["title"].lower()
     score  = deal["score"]
     source = deal["source"]
+    ap     = deal.get("amazon_price")
+    es     = deal.get("ebay_sold")
+
+    price_m    = re.search(r'\$([\d,.]+)', deal["title"])
+    deal_price = float(price_m.group(1).replace(",","")) if price_m else None
+
+    roi_lines = []
+    if deal_price and ap:
+        margin  = ap - deal_price
+        roi_pct = (margin / deal_price * 100) if deal_price else 0
+        roi_lines.append(f"Deal ${deal_price:.0f} → Amazon ${ap:.0f}  (+${margin:.0f} / {roi_pct:.0f}% ROI)")
+    if es:
+        if deal_price:
+            roi_lines.append(f"eBay sold avg ${es:.0f}  (+${es - deal_price:.0f} vs deal price)")
+        else:
+            roi_lines.append(f"eBay sold avg ${es:.0f}")
 
     if source == "CamelCamelCamel":
-        return "BUY 🟢", "Your watchlist target was hit — check condition & rank"
+        return "BUY 🟢", "Watchlist target hit", roi_lines
 
-    if any(x in title for x in ["price error","pricing error","glitch","mistake price","pricing mistake"]):
-        return "BUY 🟢", "Price error detected — act now, these expire in minutes"
+    if any(x in title for x in ["price error","pricing error","glitch","mistake price"]):
+        return "BUY 🟢", "Price error — act NOW, expires in minutes", roi_lines
+
+    if deal_price and ap and ap / deal_price >= 2.5:
+        return "BUY 🟢", f"3× rule: Amazon is {ap/deal_price:.1f}× the deal price", roi_lines
+
+    if deal_price and es and es / deal_price >= 2.0:
+        return "BUY 🟢", f"eBay sold avg is {es/deal_price:.1f}× the deal price", roi_lines
 
     if source == "Amazon Warehouse" and score >= 30:
-        return "BUY 🟢", "Warehouse deal on tracked category — verify condition grade"
+        return "BUY 🟢", "Warehouse deal — check condition grade", roi_lines
 
     pct_m = re.search(r'(\d+)\s*%\s*off', title)
     pct   = int(pct_m.group(1)) if pct_m else 0
 
     if pct >= 60 and score >= 30:
-        return "BUY 🟢", f"{pct}% off + keyword match — confirm with Keepa before buying"
+        return "BUY 🟢", f"{pct}% off + keyword match — verify with Keepa", roi_lines
     if pct >= 40 and score >= 20:
-        return "WATCH 🟡", f"{pct}% off — check Amazon price history and sales rank"
+        return "WATCH 🟡", f"{pct}% off — check price history", roi_lines
     if score >= 35:
-        return "WATCH 🟡", "Strong keyword match — worth a manual look"
+        return "WATCH 🟡", "Strong keyword match — manual check", roi_lines
     if score >= 20:
-        return "WATCH 🟡", "Soft signal — quick glance recommended"
+        return "WATCH 🟡", "Soft signal — worth a glance", roi_lines
 
-    return "PASS 🔴", "Low relevance score"
+    return "PASS 🔴", "Low relevance", roi_lines
 
 
 # ── telegram ───────────────────────────────────────────────────────────────────
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        try:
-            requests.post(url, json={
-                "chat_id":                  TELEGRAM_CHAT_ID,
-                "text":                     chunk,
-                "parse_mode":               "HTML",
-                "disable_web_page_preview": True,
-            }, timeout=15)
-        except Exception as ex:
-            logging.error(f"Telegram send failed: {ex}")
+def send_message(text):
+    SESSION.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+              "parse_mode": "HTML", "disable_web_page_preview": False},
+        timeout=15,
+    )
+    time.sleep(0.4)
+
+def send_summary_header(count, source_summary):
+    ts = datetime.now(timezone.utc).strftime("%-I:%M %p UTC · %b %-d")
+    send_message(
+        f"🔎 <b>Deal Hunt — {ts}</b>\n"
+        f"{count} candidates found\n"
+        f"<i>{source_summary}</i>"
+    )
+
+def send_deal_card(deal, verdict, reason, roi_lines, index, total):
+    lines = [
+        f"{verdict}  <b>[{index}/{total}] {deal['title'][:110]}</b>",
+        f"",
+        f"📌 {deal['source']}  ·  score {deal['score']}",
+        f"💡 {reason}",
+    ]
+    for rl in roi_lines:
+        lines.append(f"💰 {rl}")
+    if deal.get("amazon_url"):
+        lines.append(f"🛒 <a href=\"{deal['amazon_url']}\">Amazon</a>")
+    lines.append(f"🔗 <a href=\"{deal['url']}\">Source</a>")
+    send_message("\n".join(lines))
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -380,50 +365,52 @@ def main():
     logging.info(f"Loaded {len(seen)} previously-seen deals")
 
     all_deals = []
-    all_deals += fetch_slickdeals()
+    all_deals += fetch_all_rss()
     for sub in ["deals","Flipping","GameDeals","buildapcsales","MUAontheCheap","flipping"]:
         all_deals += fetch_reddit(sub)
-    all_deals += fetch_nitter()
     all_deals += fetch_amazon_warehouse()
     all_deals += fetch_ccc_watchlist()
-    all_deals += fetch_brickseek()
 
     source_counts = {}
     for d in all_deals:
         source_counts[d["source"]] = source_counts.get(d["source"], 0) + 1
-    logging.info(f"Fetched {len(all_deals)} deals from: {source_counts}")
+    logging.info(f"Fetched {len(all_deals)} from: {source_counts}")
 
     new_deals = [d for d in all_deals if d["id"] not in seen]
     logging.info(f"  {len(new_deals)} new since last run")
 
     candidates = sorted(
         [d for d in new_deals if d["score"] >= MIN_SCORE],
-        key=lambda x: x["score"],
-        reverse=True,
-    )[:12]
-    logging.info(f"  {len(candidates)} candidates above score {MIN_SCORE}")
+        key=lambda x: x["score"], reverse=True,
+    )[:10]
+    logging.info(f"  {len(candidates)} candidates above score {MIN_SCORE}; enriching...")
 
     new_seen = {d["id"] for d in new_deals}
 
     if not candidates:
-        logging.info("No candidates — skipping Telegram message")
+        logging.info("No candidates")
         save_seen(seen | new_seen)
         return
 
-    ts = datetime.now(timezone.utc).strftime("%-I:%M %p UTC · %b %-d")
-    lines = [f"<b>🔎 Deal Alert — {ts}</b>\n"]
-
     for d in candidates:
-        verdict, reason = recommend(d)
-        lines.append(
-            f"{verdict}  <b>{d['title'][:105]}</b>\n"
-            f"   📌 {d['source']}  ·  score {d['score']}\n"
-            f"   💡 {reason}\n"
-            f"   🔗 {d['url']}\n"
-        )
+        enrich(d)
 
-    send_telegram("\n".join(lines))
-    logging.info(f"Sent {len(candidates)} alerts; tracking {len(seen | new_seen)} seen IDs")
+    rated = [(d, *recommend(d)) for d in candidates]
+    buys  = [(d,v,r,roi) for d,v,r,roi in rated if "BUY"   in v]
+    watch = [(d,v,r,roi) for d,v,r,roi in rated if "WATCH" in v]
+    passes= [(d,v,r,roi) for d,v,r,roi in rated if "PASS"  in v]
+
+    final = buys + watch
+    if len(final) < 5:
+        final += passes[:5 - len(final)]
+
+    top_sources = ", ".join(list(source_counts.keys())[:5])
+    send_summary_header(len(final), top_sources)
+
+    for i, (deal, verdict, reason, roi_lines) in enumerate(final, 1):
+        send_deal_card(deal, verdict, reason, roi_lines, i, len(final))
+
+    logging.info(f"Sent {len(final)} alerts; tracking {len(seen | new_seen)} seen IDs")
     save_seen(seen | new_seen)
 
 
