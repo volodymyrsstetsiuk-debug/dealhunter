@@ -1,6 +1,5 @@
 """
-Deal Hunter v2 — multi-source monitor with Amazon + eBay enrichment.
-Runs every 10 minutes via cron-job.org → GitHub Actions.
+Deal Hunter v2.1 — multi-source + ScraperAPI-backed Amazon/eBay verdict.
 """
 
 import os
@@ -14,17 +13,15 @@ from urllib.parse import urlparse
 import sources
 import enrich
 
-# ---- Config ----
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen.json")
 SEEN_TTL_DAYS = 7
-MIN_SCORE_FOR_ENRICHMENT = 20   # below this, don't bother looking up Amazon/eBay
-MAX_ENRICHMENTS_PER_RUN = 6     # protect against rate limits / time
+MIN_SCORE_FOR_ENRICHMENT = 20
+MAX_ENRICHMENTS_PER_RUN = 6   # caps ScraperAPI usage per run (2 lookups each = 12 calls max)
 MAX_ALERTS_PER_RUN = 10
 
-# Anything matching one of these in the title gets +10 to its score.
 KEYWORDS_BOOST = [
     "lego", "pokemon", "pokémon", "nintendo", "switch", "playstation", "ps5",
     "xbox", "funko", "trading card", "magic the gathering",
@@ -38,7 +35,6 @@ KEYWORDS_BOOST = [
     "75% off", "80% off", "85% off", "90% off",
 ]
 
-# Drop deals containing any of these.
 KEYWORDS_SKIP = [
     "credit card", "auto insurance", "car insurance", "mortgage",
     "mattress", "subscription", "streaming service", "web hosting",
@@ -140,30 +136,22 @@ def format_alert(deal):
         "",
     ]
 
-    # Deal price line
     if deal.get("deal_price"):
         lines.append(f"💵 Deal price: *${deal['deal_price']:.2f}*")
 
-    # Amazon block
     amazon = deal.get("amazon")
     if amazon and amazon.get("found"):
         a_line = f"🟧 Amazon: *${amazon['price']:.2f}*"
         if amazon.get("url"):
             a_line += f" — [view]({amazon['url']})"
         lines.append(a_line)
-    elif amazon is not None:
-        lines.append("🟧 Amazon: not found")
 
-    # eBay block
     ebay = deal.get("ebay")
     if ebay and ebay.get("found"):
         lines.append(f"🔵 eBay sold (90d): median *${ebay['median_price']:.0f}* "
                      f"(range ${ebay['min_price']:.0f}–${ebay['max_price']:.0f}, "
                      f"{ebay['sold_count']} sold)")
-    elif ebay is not None:
-        lines.append("🔵 eBay: no recent sold data")
 
-    # Profit + verdict reason
     if deal.get("profit") is not None:
         lines.append(f"📊 Est. profit: *${deal['profit']:.2f}/unit*")
 
@@ -193,16 +181,17 @@ def main():
     print(f"Loaded {len(seen)} previously-seen deals")
 
     all_deals = sources.fetch_all()
-    print(f"Fetched {len(all_deals)} deals from {len(set(d['source'] for d in all_deals))} sources")
+    sc = {}
+    for d in all_deals:
+        sc[d["source"]] = sc.get(d["source"], 0) + 1
+    print(f"Fetched {len(all_deals)} deals from sources: {sc}")
 
     new_deals = [d for d in all_deals if deal_id(d) not in seen]
     print(f"  {len(new_deals)} new since last run")
 
-    # Score everything
     for d in new_deals:
         d["_score"] = score_deal(d)
 
-    # Filter by score, then dedupe
     candidates = [d for d in new_deals if d["_score"] >= MIN_SCORE_FOR_ENRICHMENT]
     candidates = dedupe(candidates)
     candidates.sort(key=lambda x: x["_score"], reverse=True)
@@ -210,7 +199,6 @@ def main():
 
     print(f"  {len(candidates)} candidates above score {MIN_SCORE_FOR_ENRICHMENT}; enriching...")
 
-    # Enrich (Amazon + eBay lookups + verdict)
     enriched = []
     for d in candidates:
         try:
@@ -220,13 +208,13 @@ def main():
             enriched.append({**d, "verdict": "WATCH",
                             "verdict_reason": f"Enrichment error: {e}"})
 
-    # Decide what to alert: BUY always, WATCH only if score very high, never SKIP
+    # Alert only on BUY, or WATCH with very high score
     alerts = []
     for d in enriched:
         v = d.get("verdict")
         if v == "BUY":
             alerts.append(d)
-        elif v == "WATCH" and d["_score"] >= 35:
+        elif v == "WATCH" and d["_score"] >= 40:
             alerts.append(d)
 
     alerts = alerts[:MAX_ALERTS_PER_RUN]
@@ -237,12 +225,11 @@ def main():
         print(f"  ALERT [{d['verdict']}] [{d['_score']}] {d['title'][:80]}")
         send_telegram(format_alert(d))
 
-    # Mark all fetched as seen so we don't re-process next run
     for d in all_deals:
         seen[deal_id(d)] = now_iso
 
     save_seen(seen)
-    print(f"Sent {len(alerts)} alerts (BUY/WATCH); tracking {len(seen)} seen IDs")
+    print(f"Sent {len(alerts)} alerts; tracking {len(seen)} seen IDs")
 
 
 if __name__ == "__main__":

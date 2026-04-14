@@ -71,7 +71,7 @@ _reddit_token_cache = {"token": None, "expires": 0}
 
 
 def _reddit_token():
-    """Get an OAuth bearer token (script-app flow). Cached for ~50 min."""
+    """Get an OAuth bearer token. Cached ~50 min."""
     if _reddit_token_cache["token"] and _reddit_token_cache["expires"] > time.time():
         return _reddit_token_cache["token"]
 
@@ -100,7 +100,7 @@ def _reddit_token():
 
 
 def fetch_reddit(subreddit):
-    """Fetch /new from a subreddit using OAuth (if configured) or anonymous fallback."""
+    """Fetch /new from a subreddit using OAuth if configured."""
     token = _reddit_token()
     if token:
         url = f"https://oauth.reddit.com/r/{subreddit}/new?limit=25"
