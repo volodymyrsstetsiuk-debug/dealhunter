@@ -2,8 +2,11 @@ name: Deal Hunter
 
 on:
   schedule:
-    - cron: "0 13 * * *"   # 9am ET / 8am CT daily
-  workflow_dispatch:        # manual trigger from Actions tab
+    - cron: "0 13 * * *"   # 9am ET daily
+  workflow_dispatch:
+
+permissions:
+  contents: write           # ← fixes "Permission denied to github-actions[bot]"
 
 jobs:
   run:
