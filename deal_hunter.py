@@ -45,13 +45,15 @@ KEYWORDS_SKIP = [
 
 
 # ---- State ----
-
 def load_seen():
     if not SEEN_FILE.exists():
         return {}
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception:
+        return {}
+    # Handle legacy formats: if somehow a list, reset; if dict, keep
+    if not isinstance(data, dict):
         return {}
     cutoff = (datetime.now(timezone.utc) - timedelta(days=SEEN_TTL_DAYS)).isoformat()
     return {k: v for k, v in data.items() if v > cutoff}
