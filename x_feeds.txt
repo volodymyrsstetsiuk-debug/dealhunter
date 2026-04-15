@@ -22,3 +22,5 @@
 # Pricerrors|https://rss.app/feeds/YOUR_FEED_ID.xml
 # DealsPlus|https://rss.app/feeds/YOUR_FEED_ID.xml
 # Lootbot|https://rss.app/feeds/YOUR_FEED_ID.xml
+
+https://rss.app/feeds/QJyoBCxZS3P2ioDM.xml
