@@ -28,7 +28,7 @@ SEEN_FILE = Path("seen.json")
 SEEN_TTL_DAYS = 7
 
 # TUNED for 5-min cron + want-only-best-deals
-MIN_SCORE_FOR_ENRICHMENT = 22   # was 20 — raises quality bar
+MIN_SCORE_FOR_ENRICHMENT = 30   # was 20 — raises quality bar
 MAX_ENRICHMENTS_PER_RUN = 5     # was 8 — keeps ScraperAPI burn manageable
 MAX_ALERTS_PER_RUN = 10
 
