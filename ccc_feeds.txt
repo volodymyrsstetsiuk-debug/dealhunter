@@ -1,0 +1,29 @@
+# Camelcamelcamel watchlist — track specific Amazon products at YOUR target price.
+# Format: ASIN|TARGET_PRICE|RSS_URL
+# Lines starting with # are comments.
+#
+# How to set this up (one-time, ~5 min):
+#
+#   1. Go to https://camelcamelcamel.com/  and create a free account
+#   2. Find a product on Amazon you'd buy at the right price (note the ASIN — it's the
+#      10-character code in the URL, e.g. amazon.com/dp/B07XJ8C8F5 → ASIN is B07XJ8C8F5)
+#   3. Search that ASIN on CCC, click into the product page
+#   4. Click "Set up a price watch" — set your TARGET PRICE (the price at which you'd buy)
+#   5. CCC adds it to your watchlist
+#   6. Go to your CCC profile → "RSS Feeds" → copy the per-product RSS URL
+#   7. Paste below as: ASIN|target_price|RSS_URL
+#
+# Examples of what to add (these are made up — replace with real ASINs you'd flip):
+#
+#   B07XJ8C8F5|150.00|https://camelcamelcamel.com/product/B07XJ8C8F5/rss
+#   B08N5KWB9H|45.00|https://camelcamelcamel.com/product/B08N5KWB9H/rss
+#
+# IDEAS for what to watch:
+#   - LEGO retired sets (search "retired LEGO sets that flip" on YouTube)
+#   - Trading card sealed booster boxes (Pokémon, MTG, sports)
+#   - Discontinued food/beauty items (Amazon prices spike when supply dries up)
+#   - First-edition video games still selling new
+#   - Tools you've seen go on clearance before (Milwaukee, DeWalt specific SKUs)
+#
+# This source has ZERO false positives — alerts ONLY fire when YOUR target hits.
+# Build your watchlist over time as you spot flippable items.

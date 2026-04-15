@@ -1,0 +1,24 @@
+# X / Twitter accounts to monitor for deals + price errors.
+# Format: NAME|RSS_URL  (or just RSS_URL on its own line)
+# Lines starting with # are comments.
+#
+# How to get RSS URLs:
+#   1. Go to https://rss.app/  (free tier: 5 feeds)
+#   2. Sign up
+#   3. Click "New Feed" → paste the X/Twitter profile URL (e.g. https://x.com/Pricerrors)
+#   4. Click "Generate"
+#   5. Copy the RSS URL it gives you
+#   6. Paste below as: AccountName|https://rss.app/feeds/...
+#
+# Recommended accounts to monitor (focus on price errors + retail flips):
+#   @Pricerrors     — the gold standard for price errors
+#   @DealsPlus      — broad deal aggregator
+#   @lootbot_deals  — flippable items with margin focus
+#   @ResellCalendar — release/restock calendar for sneakers/cards
+#   @FunkoDealsAlert — Funko Pop drops
+#
+# Free tier of rss.app caps you at 5 feeds — pick the most valuable ones.
+
+# Pricerrors|https://rss.app/feeds/YOUR_FEED_ID.xml
+# DealsPlus|https://rss.app/feeds/YOUR_FEED_ID.xml
+# Lootbot|https://rss.app/feeds/YOUR_FEED_ID.xml
