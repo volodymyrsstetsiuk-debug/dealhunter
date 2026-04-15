@@ -1,11 +1,10 @@
 """
-Deal Hunter v4 — parallelized + concise alerts + recency prioritized.
+Deal Hunter v5 — LLM extraction + stock check + tiered urgency.
 
-- All source fetches run concurrently
-- All marketplace lookups per deal run concurrently
-- Candidates sorted by newness so freshest deals alert first
-- Telegram messages are tight — 5-7 lines, scanable in 3 seconds
-- Raised MIN_SCORE for 5-min cron = higher signal, fewer false alarms
+Tiers (all alert immediately, just with different styling):
+  🚨 EMERGENCY — profit ≥ $50, ROI ≥ 75%, demand confirmed (loud notification)
+  🟢 STRONG    — profit ≥ $20, ROI ≥ 50%, demand confirmed (normal alert)
+  🟡 NORMAL    — profit ≥ $8, ROI ≥ 30% OR passes 3× rule (silent notification)
 """
 
 import os
@@ -26,10 +25,8 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen.json")
 SEEN_TTL_DAYS = 7
-
-# TUNED for 5-min cron + want-only-best-deals
-MIN_SCORE_FOR_ENRICHMENT = 30   # was 20 — raises quality bar
-MAX_ENRICHMENTS_PER_RUN = 5     # was 8 — keeps ScraperAPI burn manageable
+MIN_SCORE_FOR_ENRICHMENT = 30
+MAX_ENRICHMENTS_PER_RUN = 5
 MAX_ALERTS_PER_RUN = 10
 
 KEYWORDS_BOOST = [
@@ -76,29 +73,24 @@ def deal_id(deal):
     return f"{deal['source']}::{deal['url']}"
 
 
-# ---- Scoring ----
+# ---- Scoring (unchanged from v4) ----
 
 def score_deal(deal):
     text = (deal["title"] + " " + deal.get("description", "")).lower()
-
     if any(skip in text for skip in KEYWORDS_SKIP):
         return -1
-
     score = 0
     for kw in KEYWORDS_BOOST:
         if kw in text:
             score += 10
-
     pct = re.search(r"(\d{2,3})\s*%\s*off", text)
     if pct:
         p = int(pct.group(1))
         if p >= 50:
             score += p // 5
-
     if "upvotes" in deal:
         score += min(deal["upvotes"] // 10, 30)
         score += min(deal.get("comments", 0) // 5, 15)
-
     src = deal["source"]
     if src == "CCC-Watchlist":
         score += 50
@@ -114,10 +106,8 @@ def score_deal(deal):
         score += 10
     elif src == "Woot":
         score += 8
-
     if any(x in text for x in ["price error", "pricing error", "glitch", "underpriced"]):
         score += 35
-
     return score
 
 
@@ -135,10 +125,7 @@ def dedupe(deals):
     return result
 
 
-# ---- Recency scoring — freshness as a signal ----
-
 def recency_key(deal):
-    """Sort key: newest deals first. struct_time from feedparser, float from reddit."""
     pub = deal.get("published")
     if pub is None:
         return 0
@@ -152,45 +139,51 @@ def recency_key(deal):
     return 0
 
 
-# ---- Telegram (concise format) ----
+# ---- Telegram (tiered formatting) ----
 
 def escape_md(s):
     return (s or "").replace("*", "").replace("_", "").replace("[", "(").replace("]", ")")
 
 
 def format_alert(deal):
-    """Tight 5-7 line format. Scanable in 3 seconds."""
-    verdict = deal.get("verdict", "WATCH")
-    emoji_map = {"BUY": "🟢", "WATCH": "🟡", "SKIP": "⚪"}
-    emoji = emoji_map.get(verdict, "🟡")
-
+    """Format varies by tier. EMERGENCY gets the most prominence."""
+    tier = deal.get("tier", "NORMAL")
     src = deal["source"]
-    prefix = ""
+
+    # Header by tier
+    if tier == "EMERGENCY":
+        header = "🚨🚨🚨 *PRICE ERROR / EMERGENCY BUY* 🚨🚨🚨"
+    elif tier == "STRONG":
+        header = "🟢 *STRONG BUY*"
+    else:
+        header = "🟡 *BUY*"
+
+    # Source prefix
+    src_prefix = ""
     if src == "CCC-Watchlist":
-        prefix = "🎯 "
+        src_prefix = "🎯 WATCHLIST · "
     elif src.startswith("X-"):
-        prefix = "⚡ "
+        src_prefix = "⚡ X · "
 
-    # Trim title hard — max 120 chars for scanability
     title = escape_md(deal["title"][:120])
+    profit = deal.get("profit", 0) or 0
 
-    # Top line: verdict + profit (if known) + score
-    header_parts = [f"{prefix}{emoji} *{verdict}*"]
-    if deal.get("profit") is not None and deal["profit"] > 0:
-        header_parts.append(f"+${deal['profit']:.0f}")
-    header_parts.append(f"· {src}")
-    header = " ".join(header_parts)
+    lines = [
+        f"{header}",
+        f"{src_prefix}*+${profit:.0f} profit*",
+        "",
+        f"*{title}*",
+    ]
 
-    lines = [header, "", f"*{title}*"]
-
-    # One-line price summary
+    # Single-line price summary
     price_bits = []
     if deal.get("deal_price"):
         price_bits.append(f"💵 ${deal['deal_price']:.0f}")
     if deal.get("amazon") and deal["amazon"].get("found"):
         price_bits.append(f"🟧 ${deal['amazon']['price']:.0f}")
     if deal.get("ebay") and deal["ebay"].get("found"):
-        price_bits.append(f"🔵 ${deal['ebay']['median_price']:.0f} ({deal['ebay']['sold_count']} sold)")
+        e = deal["ebay"]
+        price_bits.append(f"🔵 ${e['median_price']:.0f} ({e['sold_count']} sold)")
     if deal.get("mercari") and deal["mercari"].get("found"):
         price_bits.append(f"🟣 ${deal['mercari']['median_price']:.0f}")
     if deal.get("google") and deal["google"].get("found"):
@@ -199,17 +192,22 @@ def format_alert(deal):
     if price_bits:
         lines.append(" | ".join(price_bits))
 
-    lines.append(f"[👉 Buy here]({deal['url']})")
+    # Stock status
+    if deal.get("in_stock") is True:
+        lines.append("✅ In stock")
 
-    # Short reasoning line if present
+    # Buy link — always prominent
+    lines.append(f"\n[👉 BUY HERE]({deal['url']})")
+
+    # Quick reason
     if deal.get("verdict_reason"):
-        reason = escape_md(deal["verdict_reason"][:120])
-        lines.append(f"_{reason}_")
+        lines.append(f"_{escape_md(deal['verdict_reason'][:120])}_")
 
     return "\n".join(lines)
 
 
-def send_telegram(message):
+def send_telegram(message, silent=False):
+    """silent=True sends without sound — used for NORMAL tier."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, data={
@@ -217,6 +215,7 @@ def send_telegram(message):
             "text": message,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False,
+            "disable_notification": silent,
         }, timeout=15)
         if not r.ok:
             print(f"Telegram error {r.status_code}: {r.text[:200]}")
@@ -231,7 +230,6 @@ def main():
     seen = load_seen()
     print(f"Loaded {len(seen)} previously-seen deals")
 
-    # ── Fetch all sources in parallel (v4 win #1)
     fetch_start = time.time()
     all_deals = sources.fetch_all()
     fetch_time = time.time() - fetch_start
@@ -241,24 +239,19 @@ def main():
         sc[d["source"]] = sc.get(d["source"], 0) + 1
     print(f"Fetched {len(all_deals)} deals in {fetch_time:.1f}s: {sc}")
 
-    # Filter to new
     new_deals = [d for d in all_deals if deal_id(d) not in seen]
     print(f"  {len(new_deals)} new since last run")
 
-    # Score
     for d in new_deals:
         d["_score"] = score_deal(d)
 
-    # Pick candidates — sort by (score desc, recency desc) so best AND freshest float up
     candidates = [d for d in new_deals if d["_score"] >= MIN_SCORE_FOR_ENRICHMENT]
     candidates = dedupe(candidates)
     candidates.sort(key=lambda x: (x["_score"], recency_key(x)), reverse=True)
     candidates = candidates[:MAX_ENRICHMENTS_PER_RUN]
 
-    print(f"  {len(candidates)} candidates above score {MIN_SCORE_FOR_ENRICHMENT}; enriching in parallel...")
+    print(f"  {len(candidates)} candidates above score {MIN_SCORE_FOR_ENRICHMENT}; enriching...")
 
-    # ── Enrich candidates in parallel (v4 win #2)
-    # Each enrich_deal internally parallelizes its 4 marketplace lookups too (v4 win #3)
     enriched = []
     enrich_start = time.time()
     if candidates:
@@ -270,22 +263,27 @@ def main():
                 except Exception as e:
                     d = futures[fut]
                     print(f"  Enrich failed '{d['title'][:60]}': {e}")
-                    enriched.append({**d, "verdict": "WATCH",
+                    enriched.append({**d, "verdict": "WATCH", "tier": None,
                                      "verdict_reason": f"Error: {e}"})
     enrich_time = time.time() - enrich_start
 
-    # Alert decisions — freshest first so you see newest before scrolling
-    enriched.sort(key=recency_key, reverse=True)
+    # Sort: EMERGENCY first, then STRONG, then NORMAL, then by recency within tier
+    tier_order = {"EMERGENCY": 0, "STRONG": 1, "NORMAL": 2}
+    enriched.sort(key=lambda d: (
+        tier_order.get(d.get("tier"), 99),
+        -recency_key(d),
+    ))
 
+    # Pick what to alert
     alerts = []
     for d in enriched:
-        v = d.get("verdict")
+        tier = d.get("tier")
         src = d["source"]
+        # CCC + X always alert (you set the trigger / time-sensitive)
         if src == "CCC-Watchlist" or src.startswith("X-"):
-            alerts.append(d)
-        elif v == "BUY":
-            alerts.append(d)
-        elif v == "WATCH" and d["_score"] >= 45:  # stricter WATCH bar for 5-min cron
+            if d.get("verdict") != "SKIP":  # respect OOS
+                alerts.append(d)
+        elif tier in ("EMERGENCY", "STRONG", "NORMAL"):
             alerts.append(d)
 
     alerts = alerts[:MAX_ALERTS_PER_RUN]
@@ -293,8 +291,11 @@ def main():
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for d in alerts:
-        print(f"  ALERT [{d['verdict']}] [{d['_score']}] {d['title'][:80]}")
-        send_telegram(format_alert(d))
+        tier = d.get("tier", "?")
+        print(f"  ALERT [{tier}] [{d.get('verdict')}] [{d['_score']}] {d['title'][:80]}")
+        # NORMAL tier sends silently (no sound), others ping
+        silent = (tier == "NORMAL")
+        send_telegram(format_alert(d), silent=silent)
 
     for d in all_deals:
         seen[deal_id(d)] = now_iso
