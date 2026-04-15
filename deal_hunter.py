@@ -1,15 +1,22 @@
 """
-Deal Hunter v3 — multi-source + ScraperAPI Amazon/eBay verdict.
-New in v3: X/Twitter price-error monitoring, CCC watchlist, Brickseek clearance.
+Deal Hunter v4 — parallelized + concise alerts + recency prioritized.
+
+- All source fetches run concurrently
+- All marketplace lookups per deal run concurrently
+- Candidates sorted by newness so freshest deals alert first
+- Telegram messages are tight — 5-7 lines, scanable in 3 seconds
+- Raised MIN_SCORE for 5-min cron = higher signal, fewer false alarms
 """
 
 import os
 import re
 import json
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import sources
 import enrich
@@ -19,8 +26,10 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen.json")
 SEEN_TTL_DAYS = 7
-MIN_SCORE_FOR_ENRICHMENT = 20
-MAX_ENRICHMENTS_PER_RUN = 8
+
+# TUNED for 5-min cron + want-only-best-deals
+MIN_SCORE_FOR_ENRICHMENT = 30   # was 20 — raises quality bar
+MAX_ENRICHMENTS_PER_RUN = 5     # was 8 — keeps ScraperAPI burn manageable
 MAX_ALERTS_PER_RUN = 10
 
 KEYWORDS_BOOST = [
@@ -45,6 +54,7 @@ KEYWORDS_SKIP = [
 
 
 # ---- State ----
+
 def load_seen():
     if not SEEN_FILE.exists():
         return {}
@@ -52,7 +62,6 @@ def load_seen():
         data = json.loads(SEEN_FILE.read_text())
     except Exception:
         return {}
-    # Handle legacy formats: if somehow a list, reset; if dict, keep
     if not isinstance(data, dict):
         return {}
     cutoff = (datetime.now(timezone.utc) - timedelta(days=SEEN_TTL_DAYS)).isoformat()
@@ -91,15 +100,14 @@ def score_deal(deal):
         score += min(deal.get("comments", 0) // 5, 15)
 
     src = deal["source"]
-    # Source quality boost — higher = trusted/curated
     if src == "CCC-Watchlist":
-        score += 50  # YOU set the trigger price = always relevant
+        score += 50
     elif src.startswith("X-"):
-        score += 30  # X price-error accounts = real-time edge
+        score += 30
     elif src == "Slickdeals-FP":
         score += 20
     elif src.startswith("Brickseek-"):
-        score += 18  # Real clearance with retailer pricing
+        score += 18
     elif src == "DealNews":
         score += 12
     elif src == "Slickdeals-Pop":
@@ -127,110 +135,148 @@ def dedupe(deals):
     return result
 
 
-# ---- Telegram ----
+# ---- Recency scoring — freshness as a signal ----
+
+def recency_key(deal):
+    """Sort key: newest deals first. struct_time from feedparser, float from reddit."""
+    pub = deal.get("published")
+    if pub is None:
+        return 0
+    try:
+        if isinstance(pub, (int, float)):
+            return float(pub)
+        if hasattr(pub, "__iter__"):
+            return time.mktime(pub)
+    except Exception:
+        pass
+    return 0
+
+
+# ---- Telegram (concise format) ----
 
 def escape_md(s):
     return (s or "").replace("*", "").replace("_", "").replace("[", "(").replace("]", ")")
 
 
 def format_alert(deal):
+    """Tight 5-7 line format. Scanable in 3 seconds."""
     verdict = deal.get("verdict", "WATCH")
-    emoji = {"BUY": "🟢 BUY", "WATCH": "🟡 WATCH", "SKIP": "⚪ SKIP"}.get(verdict, "🟡")
+    emoji_map = {"BUY": "🟢", "WATCH": "🟡", "SKIP": "⚪"}
+    emoji = emoji_map.get(verdict, "🟡")
 
-    # Source-specific prefix for the most exciting sources
     src = deal["source"]
+    prefix = ""
     if src == "CCC-Watchlist":
-        emoji = "🎯 WATCHLIST HIT — " + emoji
+        prefix = "🎯 "
     elif src.startswith("X-"):
-        emoji = "⚡ X ALERT — " + emoji
+        prefix = "⚡ "
 
-    title = escape_md(deal["title"][:200])
-    lines = [
-        f"{emoji} — score {deal['_score']}",
-        "",
-        f"*{title}*",
-        f"[Open deal]({deal['url']})",
-        "",
-    ]
+    # Trim title hard — max 120 chars for scanability
+    title = escape_md(deal["title"][:120])
 
+    # Top line: verdict + profit (if known) + score
+    header_parts = [f"{prefix}{emoji} *{verdict}*"]
+    if deal.get("profit") is not None and deal["profit"] > 0:
+        header_parts.append(f"+${deal['profit']:.0f}")
+    header_parts.append(f"· {src}")
+    header = " ".join(header_parts)
+
+    lines = [header, "", f"*{title}*"]
+
+    # One-line price summary
+    price_bits = []
     if deal.get("deal_price"):
-        lines.append(f"💵 Deal price: *${deal['deal_price']:.2f}*")
+        price_bits.append(f"💵 ${deal['deal_price']:.0f}")
+    if deal.get("amazon") and deal["amazon"].get("found"):
+        price_bits.append(f"🟧 ${deal['amazon']['price']:.0f}")
+    if deal.get("ebay") and deal["ebay"].get("found"):
+        price_bits.append(f"🔵 ${deal['ebay']['median_price']:.0f} ({deal['ebay']['sold_count']} sold)")
+    if deal.get("mercari") and deal["mercari"].get("found"):
+        price_bits.append(f"🟣 ${deal['mercari']['median_price']:.0f}")
+    if deal.get("google") and deal["google"].get("found"):
+        price_bits.append(f"🔎 ${deal['google']['median_price']:.0f}")
 
-    amazon = deal.get("amazon")
-    if amazon and amazon.get("found"):
-        a_line = f"🟧 Amazon: *${amazon['price']:.2f}*"
-        if amazon.get("url"):
-            a_line += f" — [view]({amazon['url']})"
-        lines.append(a_line)
+    if price_bits:
+        lines.append(" | ".join(price_bits))
 
-    ebay = deal.get("ebay")
-    if ebay and ebay.get("found"):
-        lines.append(f"🔵 eBay sold (90d): median *${ebay['median_price']:.0f}* "
-                     f"(range ${ebay['min_price']:.0f}–${ebay['max_price']:.0f}, "
-                     f"{ebay['sold_count']} sold)")
+    lines.append(f"[👉 Buy here]({deal['url']})")
 
-    if deal.get("profit") is not None:
-        lines.append(f"📊 Est. profit: *${deal['profit']:.2f}/unit*")
-
+    # Short reasoning line if present
     if deal.get("verdict_reason"):
-        lines.append(f"\n_{escape_md(deal['verdict_reason'])}_")
+        reason = escape_md(deal["verdict_reason"][:120])
+        lines.append(f"_{reason}_")
 
-    lines.append(f"\n📍 {deal['source']}")
     return "\n".join(lines)
 
 
-def send_telegram(message, silent=False):
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    r = requests.post(url, data={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-        "disable_notification": silent,
-    }, timeout=15)
-    if not r.ok:
-        print(f"Telegram error {r.status_code}: {r.text[:200]}")
+    try:
+        r = requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False,
+        }, timeout=15)
+        if not r.ok:
+            print(f"Telegram error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
 
 
 # ---- Main ----
 
 def main():
+    run_start = time.time()
     seen = load_seen()
     print(f"Loaded {len(seen)} previously-seen deals")
 
+    # ── Fetch all sources in parallel (v4 win #1)
+    fetch_start = time.time()
     all_deals = sources.fetch_all()
+    fetch_time = time.time() - fetch_start
+
     sc = {}
     for d in all_deals:
         sc[d["source"]] = sc.get(d["source"], 0) + 1
-    print(f"Fetched {len(all_deals)} deals from sources: {sc}")
+    print(f"Fetched {len(all_deals)} deals in {fetch_time:.1f}s: {sc}")
 
+    # Filter to new
     new_deals = [d for d in all_deals if deal_id(d) not in seen]
     print(f"  {len(new_deals)} new since last run")
 
+    # Score
     for d in new_deals:
         d["_score"] = score_deal(d)
 
+    # Pick candidates — sort by (score desc, recency desc) so best AND freshest float up
     candidates = [d for d in new_deals if d["_score"] >= MIN_SCORE_FOR_ENRICHMENT]
     candidates = dedupe(candidates)
-    candidates.sort(key=lambda x: x["_score"], reverse=True)
+    candidates.sort(key=lambda x: (x["_score"], recency_key(x)), reverse=True)
     candidates = candidates[:MAX_ENRICHMENTS_PER_RUN]
 
-    print(f"  {len(candidates)} candidates above score {MIN_SCORE_FOR_ENRICHMENT}; enriching...")
+    print(f"  {len(candidates)} candidates above score {MIN_SCORE_FOR_ENRICHMENT}; enriching in parallel...")
 
+    # ── Enrich candidates in parallel (v4 win #2)
+    # Each enrich_deal internally parallelizes its 4 marketplace lookups too (v4 win #3)
     enriched = []
-    for d in candidates:
-        try:
-            enriched.append(enrich.enrich_deal(d))
-        except Exception as e:
-            print(f"  Enrich failed for '{d['title'][:60]}': {e}")
-            enriched.append({**d, "verdict": "WATCH",
-                            "verdict_reason": f"Enrichment error: {e}"})
+    enrich_start = time.time()
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as ex:
+            futures = {ex.submit(enrich.enrich_deal, d): d for d in candidates}
+            for fut in as_completed(futures):
+                try:
+                    enriched.append(fut.result())
+                except Exception as e:
+                    d = futures[fut]
+                    print(f"  Enrich failed '{d['title'][:60]}': {e}")
+                    enriched.append({**d, "verdict": "WATCH",
+                                     "verdict_reason": f"Error: {e}"})
+    enrich_time = time.time() - enrich_start
 
-    # Alert decisions:
-    #   - CCC watchlist hits: ALWAYS alert (you set the trigger)
-    #   - X price-error alerts: ALWAYS alert (time-sensitive)
-    #   - BUY verdict: alert
-    #   - WATCH verdict: only if score very high (>= 40)
+    # Alert decisions — freshest first so you see newest before scrolling
+    enriched.sort(key=recency_key, reverse=True)
+
     alerts = []
     for d in enriched:
         v = d.get("verdict")
@@ -239,7 +285,7 @@ def main():
             alerts.append(d)
         elif v == "BUY":
             alerts.append(d)
-        elif v == "WATCH" and d["_score"] >= 40:
+        elif v == "WATCH" and d["_score"] >= 45:  # stricter WATCH bar for 5-min cron
             alerts.append(d)
 
     alerts = alerts[:MAX_ALERTS_PER_RUN]
@@ -254,7 +300,9 @@ def main():
         seen[deal_id(d)] = now_iso
 
     save_seen(seen)
-    print(f"Sent {len(alerts)} alerts; tracking {len(seen)} seen IDs")
+    total = time.time() - run_start
+    print(f"Done in {total:.1f}s (fetch {fetch_time:.1f}s, enrich {enrich_time:.1f}s); "
+          f"sent {len(alerts)} alerts; tracking {len(seen)} IDs")
 
 
 if __name__ == "__main__":
